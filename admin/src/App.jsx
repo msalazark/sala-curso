@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from './supabase'
+import { analyzeResponse } from './anthropic'
 import './admin.css'
 
 /* ── helpers ── */
@@ -148,6 +149,8 @@ function SessionControl({ sessionId, onBack }) {
   const [responses, setResponses] = useState([])
   const [activeTab, setActiveTab] = useState('control')  // 'control' | 'grade' | 'report'
   const [saving, setSaving] = useState({})
+  const [analyzingAll, setAnalyzingAll] = useState(false)
+  const [analyzeProgress, setAnalyzeProgress] = useState('')
 
   const load = useCallback(async () => {
     const { data: sess } = await supabase.from('sessions').select('*').eq('id', sessionId).single()
@@ -197,6 +200,36 @@ function SessionControl({ sessionId, onBack }) {
     }).eq('id', responseId)
     await load()
     setSaving(s => ({ ...s, [responseId]: false }))
+  }
+
+  const analyzeAll = async () => {
+    const pending = responses.filter(r => r.type !== 'oral' && r.content && !r.ai_label)
+    if (!pending.length || !caseData) return
+    setAnalyzingAll(true)
+    for (let i = 0; i < pending.length; i++) {
+      const r = pending[i]
+      setAnalyzeProgress(`${i + 1}/${pending.length}`)
+      try {
+        const result = await analyzeResponse({
+          content: r.content,
+          caseTitle: caseData.title,
+          pastureLabel: r.pasture_label || '',
+        })
+        await supabase.from('responses').update({
+          ai_probability: result.ai_probability,
+          ai_label: result.ai_label,
+          ai_reasoning: result.ai_reasoning,
+          ai_suggested_grade: result.suggested_grade,
+          ai_grade_justification: result.grade_justification,
+          ai_analyzed_at: new Date().toISOString(),
+        }).eq('id', r.id)
+      } catch (err) {
+        console.error(`Error analizando ${r.id}:`, err)
+      }
+    }
+    setAnalyzingAll(false)
+    setAnalyzeProgress('')
+    load()
   }
 
   const exportCsv = () => {
@@ -334,6 +367,9 @@ function SessionControl({ sessionId, onBack }) {
                 {p.label}
               </button>
             ))}
+            <button className="btn-ai btn-sm" onClick={analyzeAll} disabled={analyzingAll} style={{ marginLeft: 'auto' }}>
+              {analyzingAll ? `🤖 Analizando ${analyzeProgress}…` : '🤖 Analizar todos'}
+            </button>
           </div>
           {allPastures.map(p => {
             const rs = responses.filter(r => r.pasture_id === p.id)
@@ -342,7 +378,7 @@ function SessionControl({ sessionId, onBack }) {
               <div key={p.id} id={`pasture-${p.id}`} className="grade-section">
                 <h3 className="grade-section-title">{p.label}</h3>
                 {rs.map(r => (
-                  <ResponseCard key={r.id} response={r} onSave={saveGrade} saving={saving[r.id]} />
+                  <ResponseCard key={r.id} response={r} onSave={saveGrade} saving={saving[r.id]} caseTitle={caseData.title} />
                 ))}
               </div>
             )
@@ -380,17 +416,61 @@ function SessionControl({ sessionId, onBack }) {
   )
 }
 
-/* ── ResponseCard: una tarjeta con estrellas para calificar ── */
-function ResponseCard({ response: r, onSave, saving }) {
-  const [grade, setGrade] = useState(r.grade ?? null)
-  const [note, setNote]   = useState(r.grade_note ?? '')
-  const [saved, setSaved] = useState(false)
+const AI_META = {
+  humano:       { label: '✓ Humano',       cls: 'ai-humano' },
+  sospechoso:   { label: '~ Sospechoso',   cls: 'ai-sospechoso' },
+  ia_detectada: { label: '⚠ IA detectada', cls: 'ai-ia' },
+}
+
+/* ── ResponseCard: calificación + detección IA ── */
+function ResponseCard({ response: r, onSave, saving, caseTitle }) {
+  const [grade, setGrade]       = useState(r.grade ?? null)
+  const [note, setNote]         = useState(r.grade_note ?? '')
+  const [saved, setSaved]       = useState(false)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [aiResult, setAiResult] = useState(
+    r.ai_label ? {
+      ai_probability:     r.ai_probability,
+      ai_label:           r.ai_label,
+      ai_reasoning:       r.ai_reasoning,
+      suggested_grade:    r.ai_suggested_grade,
+      grade_justification: r.ai_grade_justification,
+    } : null
+  )
 
   const save = async () => {
     if (grade == null) return
     await onSave(r.id, grade, note)
     setSaved(true); setTimeout(() => setSaved(false), 1800)
   }
+
+  const analyze = async () => {
+    if (!r.content || r.type === 'oral') return
+    setAnalyzing(true)
+    try {
+      const result = await analyzeResponse({
+        content: r.content,
+        caseTitle: caseTitle || '',
+        pastureLabel: r.pasture_label || '',
+      })
+      setAiResult(result)
+      if (grade == null) setGrade(result.suggested_grade)
+      await supabase.from('responses').update({
+        ai_probability:          result.ai_probability,
+        ai_label:                result.ai_label,
+        ai_reasoning:            result.ai_reasoning,
+        ai_suggested_grade:      result.suggested_grade,
+        ai_grade_justification:  result.grade_justification,
+        ai_analyzed_at:          new Date().toISOString(),
+      }).eq('id', r.id)
+    } catch (err) {
+      alert(`Error al analizar: ${err.message}`)
+    } finally {
+      setAnalyzing(false)
+    }
+  }
+
+  const meta = aiResult ? AI_META[aiResult.ai_label] : null
 
   return (
     <div className="response-card">
@@ -399,11 +479,37 @@ function ResponseCard({ response: r, onSave, saving }) {
           <span className="avatar">{(r.participants?.display_name || '?')[0].toUpperCase()}</span>
           <div>
             <div className="response-name">{r.participants?.display_name}</div>
-            <div className="response-sub">{fmt(r.created_at)} · <span className={`tag tag-${r.type}`}>{r.type === 'oral' ? 'Oral' : 'Escrita'}</span></div>
+            <div className="response-sub">
+              {fmt(r.created_at)} · <span className={`tag tag-${r.type}`}>{r.type === 'oral' ? 'Oral' : 'Escrita'}</span>
+            </div>
           </div>
         </div>
+        {meta && (
+          <span className={`ai-badge ${meta.cls}`}>
+            {meta.label} · {aiResult.ai_probability}%
+          </span>
+        )}
       </div>
+
       <div className="response-text">{r.content}</div>
+
+      {r.type !== 'oral' && (
+        <div className="ai-section">
+          {aiResult ? (
+            <div className="ai-detail">
+              <span className="ai-reasoning">{aiResult.ai_reasoning}</span>
+              <span className="ai-grade-hint">
+                Nota sugerida: {aiResult.suggested_grade}★ — {aiResult.grade_justification}
+              </span>
+            </div>
+          ) : (
+            <button className="btn-ai btn-sm" onClick={analyze} disabled={analyzing}>
+              {analyzing ? '🤖 Analizando…' : '🤖 Analizar con IA'}
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="grade-row">
         <div className="stars">
           {[1, 2, 3, 4, 5].map(n => (

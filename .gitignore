@@ -5,7 +5,7 @@ node_modules/
 dist/
 dist-ssr/
 
-# environment variables
+# environment variables — NUNCA subir al repo
 .env
 .env.local
 .env.*.local
@@ -13,10 +13,6 @@ dist-ssr/
 # editor
 .vscode/
 .idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
 
 # OS
 .DS_Store
